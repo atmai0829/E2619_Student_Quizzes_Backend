@@ -82,19 +82,24 @@ class Response < ApplicationRecord
   end
 
   def aggregate_questionnaire_score
+    # Quiz questionnaires are graded against their answer key instead of using
+    # the standard rubric-style numeric score stored in Answer#answer.
+    return aggregate_quiz_questionnaire_score if quiz_questionnaire?
+
     # only count the scorable items, only when the answer is not nil
     # we accept nil as answer for scorable items, and they will not be counted towards the total score
-    sum = 0
-    scores.each do |s|
-      # For quiz responses, the weights will be 1 or 0, depending on if correct
-      sum += s.answer * s.item.weight unless s.answer.nil?  #|| !s.item.scorable?
+    scores.sum do |score|
+      next 0 if score.answer.nil?
+
+      score.answer * score.item.weight
     end
-    # puts "sum: #{sum}"
-    sum
   end
 
   # Returns the maximum possible score for this response
   def maximum_score
+    # Quiz scores are point-based: each item contributes its weight once if correct.
+    return maximum_quiz_score if quiz_questionnaire?
+
     # only count the scorable questions, only when the answer is not nil (we accept nil as
     # answer for scorable questions, and they will not be counted towards the total score)
     total_weight = 0
@@ -102,5 +107,118 @@ class Response < ApplicationRecord
       total_weight += s.item.weight unless s.answer.nil? #|| !s.item.is_a(ScoredItem)?
     end
     total_weight * questionnaire.max_question_score
+  end
+
+  private
+
+  def quiz_questionnaire?
+    questionnaire&.questionnaire_type == 'QuizQuestionnaire'
+  end
+
+  def aggregate_quiz_questionnaire_score
+    quiz_scores_by_item.sum do |item_id, item_scores|
+      item = quiz_items_by_id[item_id]
+      next 0 unless item
+      # Skip unanswered quiz items so partially saved drafts do not receive points.
+      next 0 unless quiz_answer_present?(item_scores)
+
+      quiz_item_correct?(item, item_scores) ? item.weight.to_i : 0
+    end
+  end
+
+  def maximum_quiz_score
+    quiz_items = if questionnaire.respond_to?(:items)
+                   questionnaire.items
+                 else
+                   quiz_items_by_id.values
+                 end
+
+    Array(quiz_items).sum { |item| item.weight.to_i }
+  end
+
+  def quiz_scores_by_item
+    scores.group_by(&:item_id)
+  end
+
+  def quiz_items_by_id
+    Item.where(id: quiz_scores_by_item.keys).index_by(&:id)
+  end
+
+  def quiz_answer_present?(item_scores)
+    item_scores.any? do |score|
+      score.answer.present? || score.comments.present?
+    end
+  end
+
+  def quiz_item_correct?(item, item_scores)
+    correct_choices = QuizQuestionChoice.where(question_id: item.id).select(&:iscorrect)
+    return false if correct_choices.empty?
+
+    item_type = item.question_type.to_s.downcase
+
+    if item_type.include?('checkbox')
+      # Checkbox items are all-or-nothing: the submitted set must exactly match
+      # the set of correct choices.
+      selected_answers_for_checkbox(item_scores).sort == normalized_correct_choice_texts(correct_choices).sort
+    elsif item_type.include?('text')
+      # Text answers are matched against any accepted correct answer after
+      # normalizing case and whitespace.
+      accepted_answers = normalized_correct_choice_texts(correct_choices)
+      accepted_answers.include?(normalized_text_response(item_scores.first))
+    else
+      # Radio / single-choice items may be submitted as a choice id, display text,
+      # or position depending on the caller, so we accept any identifier that
+      # resolves to the correct option.
+      selected_identifiers = selected_identifiers_for_choice_item(item_scores)
+      correct_identifiers = correct_choices.each_with_index.flat_map do |choice, index|
+        quiz_choice_identifiers(choice, index + 1)
+      end
+
+      (selected_identifiers & correct_identifiers).any?
+    end
+  end
+
+  def selected_answers_for_checkbox(item_scores)
+    item_scores.filter_map do |score|
+      # Existing checkbox answers use answer == 1 for checked entries, but quiz
+      # submissions may also arrive with only comments populated.
+      next unless score.answer.nil? || score.answer.to_i == 1
+
+      normalize_quiz_value(score.comments)
+    end.uniq
+  end
+
+  def normalized_correct_choice_texts(correct_choices)
+    correct_choices.filter_map { |choice| normalize_quiz_value(choice.txt) }.uniq
+  end
+
+  def normalized_text_response(score)
+    return if score.nil?
+
+    normalize_quiz_value(score.comments)
+  end
+
+  def selected_identifiers_for_choice_item(item_scores)
+    item_scores.flat_map do |score|
+      identifiers = []
+      identifiers << normalize_quiz_value(score.comments)
+      identifiers << normalize_quiz_value(score.answer)
+      identifiers
+    end.compact.uniq
+  end
+
+  def quiz_choice_identifiers(choice, position)
+    [
+      normalize_quiz_value(choice.id),
+      normalize_quiz_value(choice.txt),
+      normalize_quiz_value(position)
+    ].compact
+  end
+
+  def normalize_quiz_value(value)
+    # Quiz matching should ignore capitalization and stray whitespace so the
+    # answer key can be compared consistently across UI payload shapes.
+    normalized_value = value.to_s.squish.downcase
+    normalized_value.presence
   end
 end
